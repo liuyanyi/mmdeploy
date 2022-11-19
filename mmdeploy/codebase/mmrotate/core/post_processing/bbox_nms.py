@@ -1,6 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import torch
-from mmrotate.core import obb2xyxy
+from mmrotate.structures import rbox2hbox
 from torch import Tensor
 
 import mmdeploy
@@ -208,7 +208,7 @@ def _fake_multiclass_nms_rotated(boxes: Tensor,
         scores = scores[batch_inds, topk_inds, :]
 
     scores = scores.permute(0, 2, 1)
-    hboxes = obb2xyxy(boxes, version)
+    hboxes = rbox2hbox(boxes, version)
     selected_indices = ONNXNMSop.apply(hboxes, scores,
                                        max_output_boxes_per_class,
                                        iou_threshold, score_threshold)

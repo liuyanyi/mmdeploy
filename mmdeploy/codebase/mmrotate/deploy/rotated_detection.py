@@ -15,28 +15,6 @@ from mmdeploy.utils import Task, get_input_shape
 from .mmrotate import MMROTATE_TASK
 
 
-def replace_RResize(pipelines):
-    """Rename RResize to Resize.
-
-    args:
-        pipelines (list[dict]): Data pipeline configs.
-
-    Returns:
-        list: The new pipeline list with all RResize renamed to
-            Resize.
-    """
-    pipelines = copy.deepcopy(pipelines)
-    for i, pipeline in enumerate(pipelines):
-        if pipeline['type'] == 'MultiScaleFlipAug':
-            assert 'transforms' in pipeline
-            pipeline['transforms'] = replace_RResize(pipeline['transforms'])
-        elif pipeline.type == 'RResize':
-            pipelines[i].type = 'Resize'
-            if 'keep_ratio' not in pipelines[i]:
-                pipelines[i]['keep_ratio'] = True  # default value
-    return pipelines
-
-
 def process_model_config(model_cfg: mmengine.Config,
                          imgs: Union[Sequence[str], Sequence[np.ndarray]],
                          input_shape: Optional[Sequence[int]] = None):
@@ -52,23 +30,27 @@ def process_model_config(model_cfg: mmengine.Config,
     Returns:
         mmengine.Config: the model config after processing.
     """
-    from mmdet.datasets import replace_ImageToTensor
 
-    cfg = copy.deepcopy(model_cfg)
+    cfg = model_cfg.copy()
 
     if isinstance(imgs[0], np.ndarray):
+        cfg = cfg.copy()
         # set loading pipeline type
-        cfg.data.test.pipeline[0].type = 'LoadImageFromWebcam'
-    # for static exporting
-    if input_shape is not None:
-        cfg.data.test.pipeline[1]['img_scale'] = tuple(input_shape)
-        transforms = cfg.data.test.pipeline[1]['transforms']
-        for trans in transforms:
-            trans_type = trans['type']
-            if trans_type == 'Pad' and 'size_divisor' in trans:
-                trans['size_divisor'] = 1
+        cfg.test_pipeline[0].type = 'mmdet.LoadImageFromNDArray'
 
-    cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
+    pipeline = cfg.test_pipeline
+
+    for i, transform in enumerate(pipeline):
+        # for static exporting
+        if input_shape is not None and transform.type == 'mmdet.Resize':
+            pipeline[i].keep_ratio = False
+            pipeline[i].scale = tuple(input_shape)
+
+    pipeline = [
+        transform for transform in pipeline
+        if transform.type != 'mmdet.LoadAnnotations'
+    ]
+    cfg.test_pipeline = pipeline
     return cfg
 
 

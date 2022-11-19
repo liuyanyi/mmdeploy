@@ -1,26 +1,25 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import List, Sequence, Union
 
-import mmcv
+from typing import Any, List, Optional, Sequence, Tuple, Union
+
 import mmengine
 import numpy as np
 import torch
-from mmcv.utils import Registry
-from mmrotate.models.detectors import RotatedBaseDetector
+from mmengine import Config, Registry
+from mmengine.model import BaseDataPreprocessor
+from mmengine.structures import BaseDataElement, InstanceData
+from torch import Tensor, nn
 
 from mmdeploy.codebase.base import BaseBackendModel
-from mmdeploy.codebase.mmdet.deploy.object_detection_model import \
-    get_classes_from_config
 from mmdeploy.utils import (Backend, get_backend, get_codebase_config,
-                            load_config)
+                            load_config, get_partition_config)
 
 
 def __build_backend_model(cls_name: str, registry: Registry, *args, **kwargs):
     return registry.module_dict[cls_name](*args, **kwargs)
 
 
-__BACKEND_MODEL = mmcv.utils.Registry(
-    'backend_rotated_detectors', build_func=__build_backend_model)
+__BACKEND_MODEL = Registry('backend_rotated_detectors')
 
 
 @__BACKEND_MODEL.register_module('end2end')
@@ -39,33 +38,29 @@ class End2EndModel(BaseBackendModel):
             object.
     """
 
-    def __init__(
-        self,
-        backend: Backend,
-        backend_files: Sequence[str],
-        class_names: Sequence[str],
-        device: str,
-        deploy_cfg: Union[str, mmengine.Config] = None,
-        model_cfg: Union[str, mmengine.Config] = None,
-    ):
-        super(End2EndModel, self).__init__(deploy_cfg=deploy_cfg)
-        model_cfg, deploy_cfg = load_config(model_cfg, deploy_cfg)
-        self.CLASSES = class_names
+    def __init__(self,
+                 backend: Backend,
+                 backend_files: Sequence[str],
+                 device: str,
+                 deploy_cfg: Union[str, Config],
+                 data_preprocessor: Optional[Union[dict, nn.Module]] = None,
+                 **kwargs):
+        super().__init__(
+            deploy_cfg=deploy_cfg, data_preprocessor=data_preprocessor)
         self.deploy_cfg = deploy_cfg
         self.device = device
-        self.show_score = False
         self._init_wrapper(
             backend=backend, backend_files=backend_files, device=device)
 
     def _init_wrapper(self, backend: Backend, backend_files: Sequence[str],
                       device: str):
-        """Initialize the wrapper of backends.
+        """Initialize backend wrapper.
 
         Args:
             backend (Backend): The backend enum, specifying backend type.
             backend_files (Sequence[str]): Paths to all required backend files
-                (e.g. .onnx' for ONNX Runtime, '.param' and '.bin' for ncnn).
-            device (str): A string represents device type.
+                (e.g. '.onnx' for ONNX Runtime, '.param' and '.bin' for ncnn).
+            device (str): A string specifying device type.
         """
         output_names = self.output_names
         self.wrapper = BaseBackendModel._build_wrapper(
@@ -78,17 +73,17 @@ class End2EndModel(BaseBackendModel):
 
     @staticmethod
     def __clear_outputs(
-        test_outputs: List[Union[torch.Tensor, np.ndarray]]
-    ) -> List[Union[List[torch.Tensor], List[np.ndarray]]]:
+        test_outputs: List[Union[Tensor, np.ndarray]]
+    ) -> List[Union[List[Tensor], List[np.ndarray]]]:
         """Removes additional outputs and detections with zero and negative
         score.
 
         Args:
-            test_outputs (List[Union[torch.Tensor, np.ndarray]]):
+            test_outputs (List[Union[Tensor, np.ndarray]]):
                 outputs of forward_test.
 
         Returns:
-            List[Union[List[torch.Tensor], List[np.ndarray]]]:
+            List[Union[List[Tensor], List[np.ndarray]]]:
                 outputs with without zero score object.
         """
         batch_size = len(test_outputs[0])
@@ -103,91 +98,90 @@ class End2EndModel(BaseBackendModel):
                 outputs[output_id][i] = test_outputs[output_id][i, inds, ...]
         return outputs
 
-    def forward(self, img: Sequence[torch.Tensor],
-                img_metas: Sequence[Sequence[dict]], *args, **kwargs) -> list:
-        """Run forward inference.
+    def forward(self,
+                inputs: torch.Tensor,
+                data_samples: Optional[List[BaseDataElement]] = None,
+                mode: str = 'predict',
+                **kwargs) -> Any:
+        """The model forward.
 
         Args:
-            img (Sequence[torch.Tensor]): A list contains input image(s)
-                in [N x C x H x W] format.
-            img_metas (Sequence[Sequence[dict]]): A list of meta info for
-                image(s).
+            inputs (torch.Tensor): The input tensors
+            data_samples (List[BaseDataElement], optional): The data samples.
+                Defaults to None.
+            mode (str, optional): forward mode, only support `predict`.
 
         Returns:
-            list: A list contains predictions.
+            Any: Model output.
         """
-        input_img = img[0].contiguous()
-        img_metas = img_metas[0]
-        outputs = self.forward_test(input_img, img_metas, *args, **kwargs)
+        assert mode == 'predict', 'Deploy model only allow mode=="predict".'
+        inputs = inputs.contiguous()
+        outputs = self.predict(inputs)
         outputs = End2EndModel.__clear_outputs(outputs)
         batch_dets, batch_labels = outputs[:2]
-        batch_size = input_img.shape[0]
-        rescale = kwargs.get('rescale', False)
-
+        batch_size = inputs.shape[0]
+        img_metas = [data_sample.metainfo for data_sample in data_samples]
         results = []
-
+        rescale = kwargs.get('rescale', True)
         for i in range(batch_size):
             dets, labels = batch_dets[i], batch_labels[i]
-            if rescale:
-                scale_factor = img_metas[i]['scale_factor']
+            result = InstanceData()
 
+            bboxes = dets[:, :5]
+            scores = dets[:, 5]
+            # perform rescale
+            if rescale and 'scale_factor' in img_metas[i]:
+                scale_factor = img_metas[i]['scale_factor']
                 if isinstance(scale_factor, (list, tuple, np.ndarray)):
-                    assert len(scale_factor) == 4
+                    if len(scale_factor) == 2:
+                        scale_factor = np.array(scale_factor)
+                        scale_factor = np.concatenate(
+                            [scale_factor, scale_factor])
                     scale_factor = np.array(scale_factor)[None, :]  # [1,4]
-                scale_factor = torch.from_numpy(scale_factor).to(
-                    device=dets.device)
+                scale_factor = torch.from_numpy(scale_factor).to(dets)
                 dets[:, :4] /= scale_factor
-            dets = dets.cpu().numpy()
-            labels = labels.cpu().numpy()
-            dets_results = [
-                dets[labels == i, :] for i in range(len(self.CLASSES))
-            ]
-            results.append(dets_results)
+            pad_key = None
+            if 'pad_param' in img_metas[i]:
+                pad_key = 'pad_param'
+            elif 'border' in img_metas[i]:
+                pad_key = 'border'
+            if pad_key is not None:
+                scale_factor = img_metas[i].get('scale_factor',
+                                                np.array([1., 1.]))
+                x_off = img_metas[i][pad_key][2] / scale_factor[1]
+                y_off = img_metas[i][pad_key][0] / scale_factor[0]
+                bboxes[:, 0] -= x_off
+                bboxes[:, 1] -= y_off
+                bboxes *= (bboxes > 0)
+
+            # dets = dets.cpu().numpy()
+            # labels = labels.cpu().numpy()
+            # dets_results = [
+            #     dets[labels == i, :] for i in range(len(self.CLASSES))
+            # ]
+
+            result.scores = scores
+            result.bboxes = bboxes
+            result.labels = labels
+            data_samples[i].pred_instances = result
+
+            results.append(data_samples[i])
 
         return results
 
-    def forward_test(self, imgs: torch.Tensor, *args, **kwargs) -> \
-            List[torch.Tensor]:
-        """The interface for forward test.
+    def predict(self, imgs: Tensor) -> Tuple[np.ndarray, np.ndarray]:
+        """The interface for predict.
 
         Args:
-            imgs (torch.Tensor): Input image(s) in [N x C x H x W] format.
+            imgs (Tensor): Input image(s) in [N x C x H x W] format.
 
         Returns:
-            List[torch.Tensor]: A list of predictions of input images.
+            tuple[np.ndarray, np.ndarray]: dets of shape [N, num_det, 5]
+                and class labels of shape [N, num_det].
         """
         outputs = self.wrapper({self.input_name: imgs})
         outputs = self.wrapper.output_to_list(outputs)
         return outputs
-
-    def show_result(self,
-                    img: np.ndarray,
-                    result: dict,
-                    win_name: str = '',
-                    show: bool = True,
-                    score_thr: float = 0.3,
-                    out_file: str = None):
-        """Show predictions of segmentation.
-        Args:
-            img: (np.ndarray): Input image to draw predictions.
-            result (dict): A dict of predictions.
-            win_name (str): The name of visualization window.
-            show (bool): Whether to show plotted image in windows. Defaults to
-                `True`.
-            score_thr: (float): The thresh of score. Defaults to `0.3`.
-            out_file (str): Output image file to save drawn predictions.
-
-        Returns:
-            np.ndarray: Drawn image, only if not `show` or `out_file`.
-        """
-        return RotatedBaseDetector.show_result(
-            self,
-            img,
-            result,
-            score_thr=score_thr,
-            show=show,
-            win_name=win_name,
-            out_file=out_file)
 
 
 @__BACKEND_MODEL.register_module('sdk')
@@ -220,38 +214,51 @@ class SDKEnd2EndModel(End2EndModel):
         return results
 
 
-def build_rotated_detection_model(model_files: Sequence[str],
-                                  model_cfg: Union[str, mmengine.Config],
-                                  deploy_cfg: Union[str, mmengine.Config],
-                                  device: str, **kwargs):
-    """Build rotated detection model for different backends.
+def build_rotated_detection_model(
+        model_files: Sequence[str],
+        model_cfg: Union[str, Config],
+        deploy_cfg: Union[str, Config],
+        device: str,
+        data_preprocessor: Optional[Union[Config,
+                                          BaseDataPreprocessor]] = None,
+        **kwargs):
+    """Build object detection model for different backends.
 
     Args:
         model_files (Sequence[str]): Input model file(s).
-        model_cfg (str | mmengine.Config): Input model config file or Config
+        model_cfg (str | Config): Input model config file or Config
             object.
-        deploy_cfg (str | mmengine.Config): Input deployment config file or
+        deploy_cfg (str | Config): Input deployment config file or
             Config object.
-        device (str):  Device to input model.
+        device (str):  Device to input model
+        data_preprocessor (BaseDataPreprocessor | Config): The data
+            preprocessor of the model.
 
     Returns:
-        BaseBackendModel: Rotated detector for a configured backend.
+        End2EndModel: Detector for a configured backend.
     """
     # load cfg if necessary
     deploy_cfg, model_cfg = load_config(deploy_cfg, model_cfg)
 
     backend = get_backend(deploy_cfg)
-    class_names = get_classes_from_config(model_cfg)
-    model_type = get_codebase_config(deploy_cfg).get('model_type', 'end2end')
 
-    backend_rotated_detector = __BACKEND_MODEL.build(
-        model_type,
-        backend=backend,
-        backend_files=model_files,
-        class_names=class_names,
-        device=device,
-        deploy_cfg=deploy_cfg,
-        model_cfg=model_cfg,
-        **kwargs)
+    partition_config = get_partition_config(deploy_cfg)
+    if partition_config is not None:
+        partition_type = partition_config.get('type', None)
+    else:
+        codebase_config = get_codebase_config(deploy_cfg)
+        # Default Config is 'end2end'
+        partition_type = codebase_config.get('model_type', 'end2end')
 
-    return backend_rotated_detector
+    backend_detector = __BACKEND_MODEL.build(
+        dict(
+            type=partition_type,
+            backend=backend,
+            backend_files=model_files,
+            device=device,
+            model_cfg=model_cfg,
+            deploy_cfg=deploy_cfg,
+            data_preprocessor=data_preprocessor,
+            **kwargs))
+
+    return backend_detector
