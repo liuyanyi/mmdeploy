@@ -1,4 +1,4 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from .mmrotate import MMROTATE, RotatedDetection
+from .rotated_detection import MMROTATE, RotatedDetection
 
 __all__ = ['MMROTATE', 'RotatedDetection']

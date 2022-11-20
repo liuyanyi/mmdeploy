@@ -28,14 +28,12 @@ class End2EndModel(BaseBackendModel):
 
     Args:
         backend (Backend): The backend enum, specifying backend type.
-        backend_files (Sequence[str]): Paths to all required backend files(e.g.
-            '.onnx' for ONNX Runtime, '.param' and '.bin' for ncnn).
-        class_names (Sequence[str]): A list of string specifying class names.
-        device (str): A string represents device type.
-        deploy_cfg (str | mmengine.Config): Deployment config file or loaded
-            Config object.
-        model_cfg (str | mmengine.Config): Model config file or loaded Config
+        backend_files (Sequence[str]): Paths to all required backend files
+                (e.g. '.onnx' for ONNX Runtime, '.param' and '.bin' for ncnn).
+        device (str): A string specifying device type.
+        deploy_cfg (str|Config): Deployment config file or loaded Config
             object.
+        data_preprocessor (dict|nn.Module): The data preprocessor.
     """
 
     def __init__(self,
@@ -154,19 +152,11 @@ class End2EndModel(BaseBackendModel):
                 bboxes[:, 1] -= y_off
                 bboxes *= (bboxes > 0)
 
-            # dets = dets.cpu().numpy()
-            # labels = labels.cpu().numpy()
-            # dets_results = [
-            #     dets[labels == i, :] for i in range(len(self.CLASSES))
-            # ]
-
             result.scores = scores
             result.bboxes = bboxes
             result.labels = labels
             data_samples[i].pred_instances = result
-
             results.append(data_samples[i])
-
         return results
 
     def predict(self, imgs: Tensor) -> Tuple[np.ndarray, np.ndarray]:
@@ -176,7 +166,7 @@ class End2EndModel(BaseBackendModel):
             imgs (Tensor): Input image(s) in [N x C x H x W] format.
 
         Returns:
-            tuple[np.ndarray, np.ndarray]: dets of shape [N, num_det, 5]
+            tuple[np.ndarray, np.ndarray]: dets of shape [N, num_det, 6]
                 and class labels of shape [N, num_det].
         """
         outputs = self.wrapper({self.input_name: imgs})
